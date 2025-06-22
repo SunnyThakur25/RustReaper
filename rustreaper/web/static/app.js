@@ -1,0 +1,1 @@
+ReactDOM.render(<ProgressBar />, document.getElementById('root'));
