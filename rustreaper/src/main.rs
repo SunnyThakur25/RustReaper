@@ -20,7 +20,7 @@ lazy_static! {
     name = "rustreaper",
     about = "Advanced memory forensic analyzer for malware artifacts",
     version = "0.1.0",
-    author = "Sunny thakur "
+    author = "Sunny thakur"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -187,14 +187,15 @@ async fn main() -> Result<()> {
                 let analyzer = MemoryAnalyzer::new_with_rules(&cli.yara_rules).context("Failed to initialize analyzer")?;
                 let artifacts = match cli.profile.as_str() {
                     "quick" => analyzer.analyze_quick(®ions, |progress| analyze_tx.send(progress).unwrap()),
-                    "stealth" => analyzer.analyze-stealth(®ions, |progress| analyze_tx.send(progress).unwrap()),
+                    "stealth" => analyzer.analyze_stealth(®ions, |progress| analyze_tx.send(progress).unwrap()),
                     _ => analyzer.analyze(®ions, |progress| analyze_tx.send(progress).unwrap()),
                 }.context("Live process analysis failed")?;
                 
                 save_artifacts_to_db(&conn, &artifacts)?;
                 let report_path = cli.output_dir.join(format!("live_scan_{}.json", pid));
                 output::ReportWriter::new()
-                    .write(&artifacts, &report_path)?;
+                    .write(&artifacts, &report_path)
+                    .context("Failed to write report")?;
                 
                 progress_task.await.unwrap();
                 
@@ -202,6 +203,7 @@ async fn main() -> Result<()> {
                     scan_start.elapsed(), report_path.display());
             } else if let Some(dump) = dump {
                 info!("Scanning memory dump: {}", dump.display());
+                let scan_start = Instant::now();
                 let data = fs::read(dump)
                     .with_context(|| format!("Failed to read dump file: {}", dump.display()))?;
                 let regions = parser::parse_memory(&data, false, |progress| {
@@ -210,14 +212,15 @@ async fn main() -> Result<()> {
                 let analyzer = MemoryAnalyzer::new_with_rules(&cli.yara_rules).context("Failed to initialize analyzer")?;
                 let artifacts = match cli.profile.as_str() {
                     "quick" => analyzer.analyze_quick(®ions, |progress| analyze_tx.send(progress).unwrap()),
-                    "stealth" => analyzer.analyze-stealth(®ions, |progress| analyze_tx.send(progress).unwrap()),
+                    "stealth" => analyzer.analyze_stealth(®ions, |progress| analyze_tx.send(progress).unwrap()),
                     _ => analyzer.analyze(®ions, |progress| analyze_tx.send(progress).unwrap()),
                 }.context("Memory analysis failed")?;
                 
                 save_artifacts_to_db(&conn, &artifacts)?;
                 let report_path = cli.output_dir.join("memory_scan.json");
                 output::ReportWriter::new()
-                    .write(&artifacts, &report_path)?;
+                    .write(&artifacts, &report_path)
+                    .context("Failed to write report")?;
                 
                 progress_task.await.unwrap();
                 
@@ -231,9 +234,9 @@ async fn main() -> Result<()> {
             info!("Generating consolidated report in {:?} format", format);
             
             let mut aggregated = Vec::new();
-            let rows = conn.prepare("SELECT data FROM artifacts")?.query(())?;
-            for row in rows {
-                let data: String = row.get(0)?;
+            let mut statement = conn.prepare("SELECT data FROM artifacts")?;
+            while let Ok(sqlite::State::Row) = statement.next() {
+                let data: String = statement.read(0)?;
                 let artifact: Value = serde_json::from_str(&data)?;
                 aggregated.push(artifact);
             }
@@ -247,7 +250,8 @@ async fn main() -> Result<()> {
             output::ReportWriter::new()
                 .with_format(*format)
                 .with_context(*include_context)
-                .write(&aggregated, &consolidated_path)?;
+                .write(&aggregated, &consolidated_path)
+                .context("Failed to write consolidated report")?;
             
             info!("Consolidated report generated at {}.{}", 
                 consolidated_path.display(), format.extension());
