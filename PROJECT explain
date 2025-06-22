@@ -1,0 +1,526 @@
+# How RustReaper Works in Real-Time
+
+RustReaper is a cross-platform memory forensic tool that analyzes memory dumps or live processes to detect malware artifacts (e.g., hooks, shellcode, encrypted payloads). It operates in real time by parsing memory, analyzing regions, and streaming results to a CLI or React-based GUI. Below is a high-level workflow, followed by a step-by-step explanation of all scripts and their real-time contributions.
+Real-Time Workflow
+
+    Input Acquisition:
+        Reads memory dumps (e.g., dump.bin) or live process memory (via /proc on Linux, VirtualQueryEx on Windows, Mach APIs on macOS).
+        Streams memory regions to the parser with progress updates.
+    Memory Parsing:
+        Splits memory into regions (MemoryRegion) with metadata (base address, size, protection, permissions).
+        Sends progress (e.g., 50% after half the regions) to CLI/GUI via crossbeam-channel.
+    Artifact Analysis:
+        Scans regions for artifacts using YARA rules, disassembly (Capstone), and entropy (Statrs).
+        Supports modes: quick (basic checks), deep (YARA + entropy), stealth (low-impact).
+        Streams artifacts to GUI via WebSocket and stores them in SQLite.
+    Output Generation:
+        CLI: Prints artifacts or saves JSON/HTML reports.
+        GUI: Displays artifacts in a table with dual progress bars (parsing/analysis).
+        Real-time updates ensure immediate visibility of threats.
+
+Unconventional Features
+```
+    Real-Time Streaming: Artifacts are sent to the GUI as detected, not post-analysis.
+    Dynamic YARA: Rules can be updated without recompiling.
+    Cross-Platform: Handles platform-specific memory access seamlessly.
+    SQLite Persistence: Stores artifacts for consolidated reporting.
+```
+Step-by-Step Explanation of All Scripts
+
+Below, I’ll explain each script/file in the RustReaper project, detailing their role in real-time operation, execution steps, and contributions to the workflow. All scripts are cross-platform (Windows, Linux, macOS) and aligned with the project’s structure. 
+
+Role: CLI entry point, orchestrates parsing, analysis, reporting, and GUI server.
+
+Real-Time Contribution:
+
+    Parses command-line arguments (using clap) to select modes (e.g., analyze, scan, serve).
+    Coordinates parser.rs and analyzer.rs for real-time memory processing.
+    Streams progress and artifacts to CLI or GUI via crossbeam-channel.
+
+Execution Steps:
+
+    Parse Arguments:
+        Uses clap to handle subcommands: analyze (dump file), scan (live process), serve (GUI), report (consolidated report), profiles (list profiles).
+        Example: rustreaper analyze dump.bin --profile deep --yara-rules rules.yara.
+    Initialize Logging:
+        Sets up env_logger for debug/info logs.
+    Execute Subcommand:
+        analyze: Reads dump, parses regions, analyzes artifacts, saves report.
+        scan: Accesses live process, parses regions, analyzes artifacts.
+        serve: Starts Actix-web server (gui_server.rs) for GUI.
+        report: Queries SQLite for consolidated report.
+    Progress Tracking:
+        Uses PROGRESS_CHANNEL to send parsing/analysis progress (e.g., 25%, 50%).
+        CLI prints progress; GUI updates progress bars.
+
+Real-Time Example:
+
+
+rustreaper scan --live --pid 1234 --profile stealth
+
+
+    Parses process 1234’s memory in real time.
+    Streams artifacts (e.g., shellcode at 0x7fff0000) to CLI.
+    Progress updates every 10% of regions processed.
+
+2. analyzer.rs
+
+
+Role: Detects malware artifacts in memory regions.
+
+Real-Time Contribution:
+
+    Analyzes regions for hooks, shellcode, YARA matches, and high-entropy data.
+    Streams artifacts to CLI/GUI as detected.
+    Supports multiple profiles for real-time performance tuning.
+
+Execution Steps:
+
+    Initialize YARA:
+        Loads rules from rules.yara at startup.
+    Analyze Regions:
+        Iterates over MemoryRegion slices from parser.rs.
+        Checks for:
+            Hooks: JMP/CALL instructions (Capstone).
+            Shellcode: Syscalls or GetPC patterns.
+            YARA: Matches against loaded rules.
+            Entropy: Calculates Shannon entropy (Statrs).
+        Modes:
+            quick: Skips YARA/entropy.
+            deep: Full checks.
+            stealth: YARA only, low CPU.
+    Stream Artifacts:
+        Sends Artifact structs (address, type, confidence) to output.rs.
+        Updates progress (e.g., 10% per region) via callback.
+    Store Results:
+        Saves artifacts to SQLite via output.rs.
+
+Real-Time Example:
+
+    For a region with 0x0F 0x05 (syscall), detects shellcode instantly.
+    Sends Artifact { type: Shellcode, address: 0x1000 } to GUI.
+
+3. parser.rs
+
+Role: Parses memory dumps or live processes into regions.
+
+Real-Time Contribution:
+
+    Extracts MemoryRegion structs (base address, size, protection, data).
+    Streams regions to analyzer.rs with progress updates.
+    Handles platform-specific memory access in real time.
+
+Execution Steps:
+
+    Parse Input:
+        Dump: Reads file, splits into 4KB pages.
+        Live Process:
+            Linux: Reads /proc/<pid>/maps and /proc/<pid>/mem.
+            Windows: Uses VirtualQueryEx and ReadProcessMemory.
+            macOS: Uses task_for_pid, mach_vm_region, mach_vm_read.
+    Create Regions:
+        Maps memory to MemoryRegion (e.g., rwx for executable/writable).
+        Filters known regions (e.g., system libraries) if --skip-known.
+    Stream Progress:
+        Sends progress (e.g., 50% after half the regions) via crossbeam-channel.
+    Output Regions:
+        Passes regions to analyzer.rs for immediate analysis.
+
+Real-Time Example:
+
+    For PID 1234 on macOS, mach_vm_read streams 4KB regions.
+    Progress bar updates at 10% intervals in GUI.
+
+4. output.rs
+
+Role: Generates and stores analysis results.
+
+Real-Time Contribution:
+
+    Streams artifacts to CLI or GUI via WebSocket.
+    Persists artifacts in SQLite for reporting.
+    Generates JSON/HTML reports on demand.
+
+Execution Steps:
+
+    Receive Artifacts:
+        Collects Artifact structs from analyzer.rs.
+    Real-Time Output:
+        CLI: Prints artifacts with addresses and types.
+        GUI: Sends JSON via WebSocket to app.js.
+    Store in SQLite:
+        Inserts artifacts into artifacts table (columns: address, type, confidence, entropy, timestamp).
+    Generate Reports:
+        JSON: Serializes artifacts with serde_json.
+        HTML: Renders table with artifact details.
+
+Real-Time Example:
+
+    Artifact { type: YaraMatch("shellcode"), address: 0x2000 } is sent to GUI table instantly.
+    Saved to SQLite for later rustreaper report command.
+
+5. models.rs
+
+Role: Defines data structures (MemoryRegion, Artifact).
+
+Real-Time Contribution:
+
+    Provides serializable structs for streaming between modules.
+    Ensures cross-platform consistency in data representation.
+
+Execution Steps:
+
+    Define Structs:
+        MemoryRegion: { base_address, size, protection, data, is_executable, is_writable }.
+        Artifact: { address, artifact_type, description, confidence, entropy, context }.
+    Serialization:
+        Uses serde for JSON serialization to GUI and reports.
+    Usage:
+        Passed between parser.rs, analyzer.rs, and output.rs.
+
+Real-Time Example:
+
+    MemoryRegion { base_address: 0x1000, protection: "rwx" } is serialized for GUI display.
+
+6. gui_server.rs
+
+Role: Runs Actix-web server for the React GUI.
+
+Real-Time Contribution:
+
+    Serves web/index.html and static assets.
+    Streams progress and artifacts via WebSocket.
+    Updates GUI in real time during analysis.
+
+Execution Steps:
+
+    Start Server:
+        Binds to 0.0.0.0:8080 (configurable).
+        Serves web/ directory with actix-files.
+    WebSocket Handler:
+        Listens for PROGRESS_CHANNEL updates.
+        Sends JSON messages: { type: "progress", value: 50.0 } or { type: "artifact", data: {...} }.
+    Static Assets:
+        Serves ProgressBar.jsx, app.js, styles.css.
+
+Real-Time Example:
+
+    User runs rustreaper serve, opens http://localhost:8080.
+    Progress bar updates to 50% when half the regions are parsed.
+
+7. analyzer_test.rs
+
+Role: Unit tests for analyzer.rs.
+
+Real-Time Contribution:
+
+    Ensures real-time analysis reliability via mocks.
+    Tests artifact detection and progress callbacks.
+
+Execution Steps:
+
+    Setup:
+        Creates temp YARA rules and mock MemoryRegion.
+        Uses mockall for dependencies.
+    Run Tests:
+        test_analyze_hook_detection: Verifies JMP hook detection.
+        test_analyze_yara_match: Checks YARA rule matches.
+        test_analyze_high_entropy: Tests entropy calculation.
+        Progress callback frequency is verified.
+    Execute:
+    bash
+
+    cargo test --test analyzer_test
+
+Real-Time Example:
+
+    Tests confirm 0xE9 (JMP) is detected as a hook in milliseconds.
+
+8. parser_test.rs
+
+Role: Unit tests for parser.rs.
+
+Real-Time Contribution:
+
+    Validates real-time parsing across platforms.
+    Tests progress streaming and region metadata.
+
+Execution Steps:
+
+    Setup:
+        Mocks /proc (Linux), VirtualQueryEx (Windows), Mach APIs (macOS).
+        Creates temp dump files with tempfile.
+    Run Tests:
+        test_parse_memory_basic: Verifies dump parsing.
+        test_parse_live_process_macos_basic: Tests Mach API parsing.
+        Progress updates (e.g., 50%, 100%) are checked.
+    Execute:
+    bash
+
+    cargo test --test parser_test
+
+Real-Time Example:
+
+    Confirms macOS regions are parsed with r-x protection instantly.
+
+9. build.ps1 (Windows)
+
+Role: Automates build, test, and packaging on Windows.
+
+Real-Time Contribution:
+
+    Prepares binaries and assets for real-time deployment.
+    Ensures dependencies are ready for execution.
+
+Execution Steps:
+
+    Check Dependencies:
+        Verifies rustc, cargo, SQLite (installs via winget if missing).
+    Build:
+        Runs cargo build --release.
+    Test:
+        Executes cargo test.
+    Verify YARA:
+        Placeholder for verify-yara (requires main.rs update).
+    Package:
+        Copies rustreaper.exe, web/, rules/, db/.
+        Generates 4KB random dump.
+        Creates rustreaper-<version>-windows.zip.
+    Run:
+    powershell
+
+    .\build.ps1
+
+Real-Time Example:
+
+    Builds dist/rustreaper.exe in seconds, ready for immediate use.
+
+10. build.sh (Linux/macOS)
+
+Role: Automates build, test, and packaging on Linux/macOS.
+
+Real-Time Contribution:
+
+    Prepares binaries for real-time analysis.
+    Handles platform-specific dependencies.
+
+Execution Steps:
+
+    Check Dependencies:
+        Verifies rustc, cargo, SQLite (libsqlite3-dev on Linux, brew on macOS).
+    Build:
+        Runs cargo build --release.
+    Test:
+        Executes cargo test.
+    Verify YARA:
+        Placeholder for verify-yara.
+    Package:
+        Copies rustreaper, web/, rules/, db/.
+        Generates 4KB random dump with dd.
+        Creates rustreaper-<version>-<os>.tar.gz.
+    Run:
+    bash
+
+    chmod +x build.sh
+    ./build.sh
+
+Real-Time Example:
+
+    Produces dist/rustreaper for macOS, deployable instantly.
+
+11. README.md
+
+Role: User documentation.
+
+Real-Time Contribution:
+
+    Guides users to set up and run RustReaper for real-time analysis.
+    Provides sample commands and YARA rules.
+
+Execution Steps:
+
+    Read Setup:
+        Beginner: Download pre-built binary or run build.sh/build.ps1.
+        Advanced: Cross-compile or use Docker.
+    Follow Usage:
+        Run CLI: rustreaper analyze dump.bin.
+        Start GUI: rustreaper serve.
+    Apply Modifications:
+        Add YARA rules or artifact types.
+
+Real-Time Example:
+
+    User follows README.md to run rustreaper serve, accessing GUI in seconds.
+
+12. web/index.html
+
+Role: Entry point for React GUI.
+
+Real-Time Contribution:
+
+    Loads app.js and ProgressBar.jsx for real-time visualization.
+    Serves as the GUI frontend.
+
+Execution Steps:
+
+    Serve:
+        Loaded by gui_server.rs at http://localhost:8080.
+    Render:
+        Includes CDN links for React, Tailwind CSS.
+        Mounts app.js for dynamic content.
+
+Real-Time Example:
+
+    User opens http://localhost:8080, sees progress bars update live.
+
+13. web/static/ProgressBar.jsx
+
+Role: React component for progress visualization.
+
+Real-Time Contribution:
+
+    Displays dual progress bars (parsing/analysis) in real time.
+    Updates via WebSocket messages.
+
+Execution Steps:
+
+    Render:
+        Receives { type: "progress", value: 50.0 } from app.js.
+        Updates Tailwind-styled progress bars.
+    Interact:
+        Shows percentage and phase (e.g., "Parsing 50%").
+
+Real-Time Example:
+
+    Parsing bar reaches 100% as regions are processed, then analysis bar starts.
+
+14. web/static/app.js
+
+Role: Main React logic for GUI.
+
+Real-Time Contribution:
+
+    Manages WebSocket connection for real-time updates.
+    Renders artifact table and progress bars.
+
+Execution Steps:
+
+    Connect WebSocket:
+        Opens connection to /ws endpoint in gui_server.rs.
+    Handle Messages:
+        Progress: Updates ProgressBar.jsx.
+        Artifacts: Adds rows to artifact table.
+    Render:
+        Displays table with columns: address, type, confidence.
+        Includes "Download Report" button.
+
+Real-Time Example:
+
+    Artifact { type: Hook, address: 0x1000 } appears in table instantly.
+
+15. web/static/styles.css
+
+Role: Tailwind CSS for GUI styling.
+
+Real-Time Contribution:
+
+    Ensures responsive, real-time GUI rendering.
+    Styles progress bars and artifact table.
+
+Execution Steps:
+
+    Apply Styles:
+        Loaded via index.html.
+        Uses Tailwind classes for layout and colors.
+    Render:
+        Ensures progress bars are visually distinct (e.g., blue for parsing, green for analysis).
+
+Real-Time Example:
+
+    GUI remains responsive as artifacts stream in.
+
+16. rules/rules.yara
+
+Role: YARA rules for malware detection.
+
+Real-Time Contribution:
+
+    Matches patterns (e.g., shellcode, encrypted data) in real time.
+    Dynamically loaded by analyzer.rs.
+
+Execution Steps:
+
+    Load Rules:
+        analyzer.rs compiles rules.yara at startup.
+    Match Patterns:
+        Scans regions for strings (e.g., 0x0F 0x05 for syscall).
+    Report Matches:
+        Creates Artifact { type: YaraMatch("rule_name") }.
+
+Real-Time Example:
+
+    Rule shellcode matches 0x0F 0x05, streams artifact to GUI.
+
+Real-Time Scenario
+
+Command:
+bash
+rustreaper scan --live --pid 1234 --profile deep --yara-rules rules/rules.yara
+
+Steps:
+
+    main.rs parses arguments, initializes logging.
+    parser.rs accesses PID 1234’s memory (e.g., mach_vm_region on macOS).
+    parser.rs streams regions (e.g., 0x1000, rwx, 4KB) with progress (10%, 20%).
+    analyzer.rs scans each region for hooks, shellcode, YARA matches, entropy.
+    analyzer.rs detects 0xE9 (JMP hook), sends Artifact to output.rs.
+    output.rs prints artifact to CLI, stores in SQLite.
+    gui_server.rs (if serve) sends artifact to app.js via WebSocket.
+    ProgressBar.jsx updates analysis progress (e.g., 50%).
+    app.js adds hook to artifact table in GUI.
+    output.rs saves JSON report to reports/.
+
+Output:
+
+    CLI: Hook detected at 0x1000, confidence: 0.95.
+    GUI: Table row: 0x1000 | Hook | 0.95.
+    SQLite: Row in artifacts table.
+    Report: reports/live_scan_1234.json.
+
+Cross-Platform Notes
+
+    Windows:
+        build.ps1 prepares rustreaper.exe.
+        parser.rs uses VirtualQueryEx for live processes.
+    Linux:
+        build.sh installs libsqlite3-dev.
+        parser.rs reads /proc/<pid>/mem.
+    macOS:
+        build.sh uses brew for SQLite.
+        parser.rs uses Mach APIs (requires root for live scanning).
+
+Unconventional Aspects
+
+    Real-Time GUI: WebSocket streaming ensures instant artifact visibility.
+    Dynamic YARA: Rules reload without recompiling.
+    Sample Dump: build.sh/build.ps1 generate random dumps for testing.
+    ML Placeholder: Entropy analysis can feed into future neural networks.
+
+Execution Instructions
+
+    Build:
+        Windows: .\build.ps1
+        Linux/macOS: ./build.sh
+    Run CLI:
+    bash
+
+dist/rustreaper scan --live --pid 1234
+Run GUI:
+bash
+dist/rustreaper serve
+
+    Open http://localhost:8080.
+
+Test:
+bash
+cargo test
